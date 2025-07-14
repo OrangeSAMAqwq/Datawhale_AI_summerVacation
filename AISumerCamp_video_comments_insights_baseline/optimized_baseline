@@ -1,0 +1,170 @@
+# 优化版 LightGBM 二分类建模方案
+
+import pandas as pd
+import numpy as np
+import json
+import lightgbm as lgb
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import f1_score
+from sklearn.preprocessing import LabelEncoder
+import time
+import warnings
+warnings.filterwarnings('ignore')
+
+# 1. 数据加载
+df_train = pd.read_csv('./train.csv')
+df_test = pd.read_csv('./testA_data.csv')
+df_submit = df_test[['did']].copy()
+
+# 合并数据用于统一预处理
+full_df = pd.concat([df_train, df_test], axis=0, ignore_index=True)
+
+# 2. 时间特征提取
+def extract_time_features(df):
+    df['ts'] = pd.to_datetime(df['common_ts'], unit='ms')
+    df['hour'] = df['ts'].dt.hour
+    df['day'] = df['ts'].dt.day
+    df['dayofweek'] = df['ts'].dt.dayofweek
+    df.drop('ts', axis=1, inplace=True)
+    return df
+
+full_df = extract_time_features(full_df)
+
+# 3. 解析 udmap JSON 字段
+def extract_udmap(df):
+    def parse_json(text):
+        try:
+            j = json.loads(text)
+            return j.get('botId', 'null'), j.get('pluginId', 'null')
+        except:
+            return 'null', 'null'
+
+    df['botId'], df['pluginId'] = zip(*df['udmap'].astype(str).map(parse_json))
+    return df
+
+full_df = extract_udmap(full_df)
+
+# 4. 类别编码（保留高频项）
+def encode_categorical(df, cols, top_n=50):
+    for col in cols:
+        vc = df[col].value_counts()
+        top_cats = vc[:top_n].index
+        df[col] = df[col].apply(lambda x: x if x in top_cats else 'other')
+        le = LabelEncoder()
+        df[col] = le.fit_transform(df[col].astype(str))
+    return df
+
+cat_cols = [
+    'device_brand', 'ntt', 'operator', 'common_country', 'common_province', 'common_city',
+    'appver', 'channel', 'os_type', 'botId', 'pluginId'
+]
+
+full_df = encode_categorical(full_df, cat_cols)
+
+# 5. 聚合用户行为（以 did 聚合）
+def aggregate_user_features(df):
+    agg = df.groupby('did').agg({
+        'mid': ['nunique', 'count'],
+        'eid': 'nunique',
+        'hour': ['mean', 'std'],
+        'day': 'nunique',
+    }).reset_index()
+    agg.columns = ['did'] + [f'{i}_{j}' for i, j in agg.columns if i != 'did']
+    return agg
+
+agg_df = aggregate_user_features(full_df)
+full_df = full_df.merge(agg_df, on='did', how='left')
+
+# ⚠️ 将 did 编码为整数类型，避免 LightGBM 报错
+le_did = LabelEncoder()
+full_df['did'] = le_did.fit_transform(full_df['did'].astype(str))
+
+# 6. 划分训练集和测试集
+train_len = len(df_train)
+train_df = full_df.iloc[:train_len].copy()
+test_df = full_df.iloc[train_len:].copy()
+
+X_train = train_df.drop(['is_new_did'], axis=1).drop(columns=['udmap'])
+y_train = train_df['is_new_did']
+X_test = test_df.drop(columns=['is_new_did', 'udmap'])
+
+# 7. 阈值搜索函数
+def find_optimal_threshold(y_true, y_pred_proba):
+    best_th, best_f1 = 0.5, 0
+    for t in np.arange(0.05, 0.95, 0.01):
+        f1 = f1_score(y_true, (y_pred_proba >= t).astype(int))
+        if f1 > best_f1:
+            best_f1 = f1
+            best_th = t
+    return best_th, best_f1
+
+# 8. LightGBM 五折交叉验证
+test_preds = np.zeros(len(X_test))
+oof_preds = np.zeros(len(X_train))
+oof_probas = np.zeros(len(X_train))
+th_list, f1_list = [], []
+models = []
+
+params = {
+    'objective': 'binary',
+    'metric': 'binary_logloss',
+    'max_depth': 10,
+    'num_leaves': 63,
+    'learning_rate': 0.05,
+    'feature_fraction': 0.8,
+    'bagging_fraction': 0.8,
+    'bagging_freq': 5,
+    'min_child_samples': 10,
+    'verbose': -1,
+    'n_jobs': 8,
+    'seed': int(time.time()) % 1000000
+}
+
+skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+
+for fold, (tr_idx, val_idx) in enumerate(skf.split(X_train, y_train)):
+    print(f"\n==== Fold {fold+1} ====")
+    X_tr, y_tr = X_train.iloc[tr_idx], y_train.iloc[tr_idx]
+    X_val, y_val = X_train.iloc[val_idx], y_train.iloc[val_idx]
+
+    lgb_train = lgb.Dataset(X_tr, label=y_tr, categorical_feature=cat_cols)
+    lgb_val = lgb.Dataset(X_val, label=y_val, categorical_feature=cat_cols)
+
+    model = lgb.train(
+        params,
+        lgb_train,
+        valid_sets=[lgb_train, lgb_val],
+        num_boost_round=1000,
+        callbacks=[
+            lgb.early_stopping(50, verbose=False),
+            lgb.log_evaluation(100)
+        ]
+    )
+
+    val_proba = model.predict(X_val)
+    test_preds += model.predict(X_test) / skf.n_splits
+    oof_probas[val_idx] = val_proba
+
+    best_th, f1 = find_optimal_threshold(y_val.values, val_proba)
+    val_pred = (val_proba >= best_th).astype(int)
+    oof_preds[val_idx] = val_pred
+
+    print(f"Best Threshold = {best_th:.3f}, F1 = {f1:.5f}")
+    th_list.append(best_th)
+    f1_list.append(f1)
+    models.append(model)
+
+# 9. 评估
+avg_th = np.mean(th_list)
+oof_f1 = f1_score(y_train, (oof_probas >= avg_th).astype(int))
+print("\n===== Final Evaluation =====")
+print(f"Avg Threshold: {avg_th:.4f}")
+print(f"CV F1: {np.mean(f1_list):.5f}, OOF F1: {oof_f1:.5f}")
+
+# 10. 生成提交结果
+test_labels = (test_preds >= avg_th).astype(int)
+df_submit['is_new_did'] = test_labels
+df_submit['proba'] = test_preds
+df_submit.to_csv('submit_optimized.csv', index=False)
+print("\n提交文件保存为 submit_optimized.csv")
+print(f"预测新增用户比例: {test_labels.mean():.4f}")
